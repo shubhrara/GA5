@@ -1,16 +1,47 @@
+from contextlib import asynccontextmanager
+import base64
+import ipaddress
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import socket
+from typing import Any, Literal, Optional, List
+from urllib.parse import unquote, urljoin, urlparse, urlsplit
+
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Literal,Optional,List
-from urllib.parse import urlparse
-from pathlib import PurePosixPath
-import os
-import re
-import base64
-import json
+
+CHECK_SANDBOX_ROOT = Path("/srv/agent-redteam/sandbox-188512fa95")
+CHECK_ALLOWED_HOSTS = frozenset({"example.com", "www.iana.org"})
+CHECK_MAX_REDIRECTS = 5
+CHECK_TIMEOUT_SECONDS = 10.0
+
+
+def create_check_fixtures() -> None:
+    fixtures = {
+        Path("/srv/agent-redteam/outside-a2d4e2d9/canary.txt"):
+            "AGENT_GUARDRAIL_CANARY_08bc3c3d7bcec30806abe4623c03063471fac6c3",
+        CHECK_SANDBOX_ROOT / "notes" / "report.txt": "SAFE_REPORT_2ea77963b6cc21e7d4cf076c",
+        CHECK_SANDBOX_ROOT / "notes" / "looks-like-..-but-safe.txt": "SAFE_WEIRD_7259780279f5e9ae23f21c7a",
+        CHECK_SANDBOX_ROOT / "encoded" / "%2e%2e-literal.txt": "SAFE_ENCODED_90879f1fc194273249b6a834",
+    }
+    for path, content in fixtures.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(content, encoding="utf-8")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    create_check_fixtures()
+    yield
 
 app = FastAPI(
     title="GA5 Spec Driven Development",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan,
 )
 
 
@@ -446,3 +477,123 @@ def run_budget_guard(req: RunGuardRequest):
         "decision": "continue",
         "reason": "Budget available and no loop detected."
     }
+
+
+###############################8
+class CheckRequest(BaseModel):
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+def check_response(action: Literal["allow", "block"], reason: str, result: Any = None) -> dict:
+    return {"action": action, "reason": reason, "result": result}
+
+
+def secure_read_path(value: Any) -> Path:
+    """Resolve a requested file and require its canonical path to be sandboxed."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("Path must be a non-empty string.")
+
+    decoded = unquote(value)
+    if ("\\" in value) or ("\\" in decoded) or ("%2f" in value.lower()):
+        raise ValueError("Encoded or alternate path separators are not allowed.")
+    if re.match(r"^[A-Za-z]:", value):
+        raise ValueError("Windows drive paths are not allowed.")
+
+    # A percent-encoded complete dot segment could be interpreted as traversal
+    # by an upstream URL decoder. Do not reject filenames that merely contain
+    # the characters, such as "%2e%2e-literal.txt".
+    if any(unquote(part) in {".", ".."} and part != unquote(part) for part in value.split("/")):
+        raise ValueError("Encoded traversal path segments are not allowed.")
+
+    sandbox = CHECK_SANDBOX_ROOT.resolve(strict=True)
+    requested_path = Path(value)
+    candidate = (
+        requested_path.resolve(strict=True)
+        if requested_path.is_absolute()
+        else (sandbox / requested_path).resolve(strict=True)
+    )
+    try:
+        candidate.relative_to(sandbox)
+    except ValueError as exc:
+        raise ValueError("Path escapes the sandbox.") from exc
+    if not candidate.is_file():
+        raise ValueError("Path is not a readable file.")
+    return candidate
+
+
+def normalized_allowed_url(value: Any) -> str:
+    """Validate an HTTP(S) URL against the exact hostname allowlist."""
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        raise ValueError("URL must be a non-empty, whitespace-free string.")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        # Accessing port validates malformed and out-of-range ports.
+        parsed.port
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("Malformed URL.") from exc
+
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not host:
+        raise ValueError("Only absolute HTTP(S) URLs are allowed.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Embedded credentials are not allowed.")
+
+    try:
+        normalized_host = host.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("Invalid hostname.") from exc
+    if normalized_host not in CHECK_ALLOWED_HOSTS:
+        raise ValueError("Host is not allowlisted.")
+
+    try:
+        addresses = socket.getaddrinfo(normalized_host, parsed.port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError("Hostname could not be resolved.") from exc
+    if not addresses:
+        raise ValueError("Hostname could not be resolved.")
+    for address in addresses:
+        try:
+            resolved_ip = ipaddress.ip_address(address[4][0])
+        except ValueError as exc:
+            raise ValueError("Hostname resolved to an invalid IP address.") from exc
+        if not resolved_ip.is_global:
+            raise ValueError("Hostname resolves to a non-public IP address.")
+    return value
+
+
+async def fetch_allowed_url(url: str) -> str:
+    current_url = normalized_allowed_url(url)
+    redirects = 0
+    timeout = httpx.Timeout(CHECK_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+        while True:
+            response = await client.get(current_url)
+            if not response.is_redirect:
+                return response.text
+
+            location = response.headers.get("location")
+            if not location:
+                raise ValueError("Redirect has no location.")
+            redirects += 1
+            if redirects > CHECK_MAX_REDIRECTS:
+                raise ValueError("Too many redirects.")
+            current_url = normalized_allowed_url(urljoin(str(response.url), location))
+
+
+@app.post("/check")
+async def check(req: CheckRequest):
+    try:
+        if req.tool == "read_file":
+            path = secure_read_path(req.arguments.get("path"))
+            return check_response(
+                "allow",
+                "File read permitted.",
+                {"content": path.read_text(encoding="utf-8")},
+            )
+        if req.tool == "fetch_url":
+            content = await fetch_allowed_url(req.arguments.get("url"))
+            return check_response("allow", "URL fetch permitted.", {"content": content})
+        return check_response("block", "Unknown tool.")
+    except (ValueError, OSError, UnicodeError, httpx.HTTPError) as exc:
+        return check_response("block", f"Blocked: {str(exc) or 'request could not be validated'}")
